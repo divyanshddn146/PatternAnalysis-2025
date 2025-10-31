@@ -23,6 +23,11 @@ class EnhancedVQVAE2Trainer:
             weight_decay=1e-5,
             betas=(0.9, 0.98)
         )
+
+        # CosineAnnealingLR adjusts LR following a cosine curve.
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=200, eta_min=1e-6)
+        # ReduceLROnPlateau reduces LR when a metric has stopped improving.
+        self.plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=15)
         
         self.lambda_rec = 1.0
         self.lambda_perceptual = 0.8
@@ -75,6 +80,9 @@ class EnhancedVQVAE2Trainer:
                 'Perceptual': f'{loss_components["perceptual"]:.4f}'
             })
         
+        # Step the cosine scheduler after each training epoch
+        self.scheduler.step()
+
         return total_loss / num_batches, total_ssim / num_batches, total_perplexity / num_batches
 
     def validate_epoch(self):
@@ -114,6 +122,8 @@ class EnhancedVQVAE2Trainer:
         
         best_ssim = 0.0
         start_epoch = 0
+        patience = 35  # Number of epochs to wait for improvement before stopping
+        patience_counter = 0
         
         # Resume from checkpoint if provided
         if resume_checkpoint and os.path.exists(resume_checkpoint):
@@ -140,6 +150,9 @@ class EnhancedVQVAE2Trainer:
             
             train_loss, train_ssim, perplexity = self.train_epoch()
             val_loss, val_ssim = self.validate_epoch()
+
+            self.plateau_scheduler.step(val_ssim)
+            current_lr = self.optimizer.param_groups[0]['lr']
             
             # Store metrics
             self.train_losses.append(train_loss)
@@ -150,11 +163,12 @@ class EnhancedVQVAE2Trainer:
             
             print(f"Train Loss: {train_loss:.4f}, Train SSIM: {train_ssim:.4f}")
             print(f"Val Loss: {val_loss:.4f}, Val SSIM: {val_ssim:.4f}")
-            print(f"Perplexity: {perplexity:.2f}")
+            print(f"Perplexity: {perplexity:.2f}, LR: {current_lr:.2e}")
             
             # Save best model checkpoint based on validation SSIM
             if val_ssim > best_ssim:
                 best_ssim = val_ssim
+                patience_counter = 0
                 
                 checkpoint_data = {
                     'epoch': epoch,
@@ -173,7 +187,11 @@ class EnhancedVQVAE2Trainer:
                 
                 torch.save(checkpoint_data, os.path.join(save_dir, 'best_model.pth'))
                 print(f"✅ Saved best model with SSIM: {val_ssim:.4f} (epoch {epoch+1})")
-                
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"🛑 Early stopping after {patience} epochs without improvement")
+                    break
         return best_ssim
 
     def _ensure_list(self, data):
@@ -196,10 +214,6 @@ def main():
     print("Starting VQ-VAE 2 Training...")
     print(f"Arguments: {args}")
     
-    # Configuration dictionary will be defined here.
-    # Data loaders will be created here.
-    # Model will be initialized here.
-    # Trainer will be instantiated and training will commence here.
 
 if __name__ == "__main__":
     main()
