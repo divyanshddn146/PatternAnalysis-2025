@@ -199,6 +199,54 @@ class Decoder(nn.Module):
         x = quantized_features[0]
         return self.network(x)
 
+class PerceptualLoss(nn.Module):
+    """Perceptual loss using VGG16 features."""
+    def __init__(self, device):
+        super(PerceptualLoss, self).__init__()
+        vgg = models.vgg16(pretrained=True).features.to(device).eval()
+        self.slice1 = nn.Sequential(*vgg[:4])
+        self.slice2 = nn.Sequential(*vgg[4:9])
+        self.slice3 = nn.Sequential(*vgg[9:16])
+        self.slice4 = nn.Sequential(*vgg[16:23])
+        
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        self.device = device
+        self.criterion = nn.L1Loss()
+        
+    def forward(self, x, y):
+        # Repeat single-channel images to 3 channels for VGG
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        if y.shape[1] == 1:
+            y = y.repeat(1, 3, 1, 1)
+            
+        # Normalize images for VGG
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+        x = (x - mean) / std
+        y = (y - mean) / std
+        
+        # Extract features and calculate loss at multiple layers
+        h_x = self.slice1(x)
+        h_y = self.slice1(y)
+        h1_loss = self.criterion(h_x, h_y)
+        
+        h_x = self.slice2(h_x)
+        h_y = self.slice2(h_y)
+        h2_loss = self.criterion(h_x, h_y)
+        
+        h_x = self.slice3(h_x)
+        h_y = self.slice3(h_y)
+        h3_loss = self.criterion(h_x, h_y)
+        
+        h_x = self.slice4(h_x)
+        h_y = self.slice4(h_y)
+        h4_loss = self.criterion(h_x, h_y)
+        
+        return (h1_loss + h2_loss + h3_loss + h4_loss) / 4
+
 class EnhancedVQVAE2(nn.Module):
     """Assembles the full VQ-VAE 2 model with hierarchical encoders and quantizers."""
     def __init__(self, in_channels=1, base_channels=64, num_levels=3, 
@@ -207,6 +255,7 @@ class EnhancedVQVAE2(nn.Module):
         super(EnhancedVQVAE2, self).__init__()
         
         self.num_levels = num_levels
+        self.device = device # Store device
         
         # Encoders
         self.bottom_up_encoder = BottomUpEncoder(
@@ -226,6 +275,9 @@ class EnhancedVQVAE2(nn.Module):
         
         # Decoder
         self.decoder = Decoder(embedding_dims, in_channels, num_residual_blocks)
+
+        # Perceptual loss
+        self.perceptual_loss = PerceptualLoss(device)
     
     def forward(self, x):
         # Encode
@@ -249,5 +301,64 @@ class EnhancedVQVAE2(nn.Module):
         reconstructions = self.decoder(quantized_features)
         
         return reconstructions, total_vq_loss, total_perplexity / self.num_levels
+
+    def calculate_enhanced_loss(self, x, reconstructions, vq_loss, lambda_rec=1.0, 
+                                lambda_perceptual=0.8, lambda_ssim=0.5):
+        """Enhanced loss combining MSE, perceptual, and SSIM losses."""
+        mse_loss = F.mse_loss(reconstructions, x)
+        perceptual_loss = self.perceptual_loss(reconstructions, x)
+        ssim_value = calculate_ssim(reconstructions, x)
+        ssim_loss = 1.0 - ssim_value
+        
+        total_loss = (lambda_rec * mse_loss + 
+                      lambda_perceptual * perceptual_loss + 
+                      lambda_ssim * ssim_loss + 
+                      vq_loss)
+        
+        loss_components = {
+            'mse': mse_loss.item(),
+            'perceptual': perceptual_loss.item(),
+            'ssim_loss': ssim_loss.item(),
+            'ssim_value': ssim_value.item(),
+            'vq': vq_loss.item(),
+            'total': total_loss.item()
+        }
+        
+        return total_loss, loss_components
+    
+    def encode(self, x):
+        bottom_up_features = self.bottom_up_encoder(x)
+        top_down_features = self.top_down_encoder(bottom_up_features)
+        
+        quantized_features = []
+        encoding_indices_list = []
+        
+        for feature, quant_conv, quantizer in zip(top_down_features, self.quantizer_conv_layers, self.quantizers):
+            projected = quant_conv(feature)
+            _, quantized, _, indices = quantizer(projected)
+            quantized_features.append(quantized)
+            encoding_indices_list.append(indices)
+        
+        return quantized_features, encoding_indices_list
+    
+    def decode(self, quantized_features):
+        return self.decoder(quantized_features)
+
+def calculate_ssim(x, y, data_range=2.0):
+    """Calculates the Structural Similarity Index (SSIM) between two images."""
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+    
+    mu_x = F.avg_pool2d(x, 3, 1, 1)
+    mu_y = F.avg_pool2d(y, 3, 1, 1)
+    
+    sigma_x = F.avg_pool2d(x ** 2, 3, 1, 1) - mu_x ** 2
+    sigma_y = F.avg_pool2d(y ** 2, 3, 1, 1) - mu_y ** 2
+    sigma_xy = F.avg_pool2d(x * y, 3, 1, 1) - mu_x * mu_y
+    
+    ssim_numerator = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
+    ssim_denominator = (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2)
+    
+    return torch.mean(ssim_numerator / ssim_denominator)
 
 print("modules_vqvae2_perceptual.py loaded.")
