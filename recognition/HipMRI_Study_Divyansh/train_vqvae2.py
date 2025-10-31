@@ -7,7 +7,6 @@ import os
 import time
 from tqdm import tqdm
 import argparse
-
 from modules_vqvae2_perceptual import EnhancedVQVAE2, calculate_ssim
 
 class EnhancedVQVAE2Trainer:
@@ -18,7 +17,6 @@ class EnhancedVQVAE2Trainer:
         self.val_loader = val_loader
         self.device = device
         
-        # Using AdamW optimizer for better weight decay handling
         self.optimizer = optim.AdamW(
             self.model.parameters(), 
             lr=learning_rate, 
@@ -26,12 +24,10 @@ class EnhancedVQVAE2Trainer:
             betas=(0.9, 0.98)
         )
         
-        # Loss weights to balance the different components of the total loss
-        self.lambda_rec = 1.0        # MSE reconstruction
-        self.lambda_perceptual = 0.8 # Perceptual loss
-        self.lambda_ssim = 0.5       # SSIM loss
+        self.lambda_rec = 1.0
+        self.lambda_perceptual = 0.8
+        self.lambda_ssim = 0.5
         
-        # Lists to store metrics for later plotting
         self.train_losses = []
         self.val_losses = []
         self.train_ssim = []
@@ -46,33 +42,32 @@ class EnhancedVQVAE2Trainer:
         total_ssim = 0
         num_batches = 0
         
+        # NOTE: Slightly modified to also return perplexity for tracking
+        total_perplexity = 0
+        
         pbar = tqdm(self.train_loader, desc="Enhanced VQVAE-2 Training")
         for data, _ in pbar:
             data = data.to(self.device)
             self.optimizer.zero_grad()
             
-            # Forward pass through the model
             reconstructions, vq_loss, perplexity = self.model(data)
             
-            # Use the enhanced loss calculation method from the model
             total_loss_batch, loss_components = self.model.calculate_enhanced_loss(
                 data, reconstructions, vq_loss,
                 self.lambda_rec, self.lambda_perceptual, self.lambda_ssim
             )
             
-            # Backward pass and optimization
             total_loss_batch.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5) # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             self.optimizer.step()
             
-            # Calculate SSIM for monitoring
             ssim = calculate_ssim(reconstructions, data)
             
             total_loss += total_loss_batch.item()
             total_ssim += ssim.item()
+            total_perplexity += perplexity.item() # Track perplexity
             num_batches += 1
             
-            # Update the progress bar
             pbar.set_postfix({
                 'Total Loss': f'{total_loss_batch.item():.4f}',
                 'SSIM': f'{ssim.item():.4f}',
@@ -80,7 +75,7 @@ class EnhancedVQVAE2Trainer:
                 'Perceptual': f'{loss_components["perceptual"]:.4f}'
             })
         
-        return total_loss / num_batches, total_ssim / num_batches
+        return total_loss / num_batches, total_ssim / num_batches, total_perplexity / num_batches
 
     def validate_epoch(self):
         """Runs a single validation epoch."""
@@ -96,7 +91,6 @@ class EnhancedVQVAE2Trainer:
                 
                 reconstructions, vq_loss, _ = self.model(data)
                 
-                # Calculate the same enhanced loss for validation
                 total_loss_val, _ = self.model.calculate_enhanced_loss(
                     data, reconstructions, vq_loss,
                     self.lambda_rec, self.lambda_perceptual, self.lambda_ssim
@@ -114,6 +108,79 @@ class EnhancedVQVAE2Trainer:
                 })
         
         return total_loss / num_batches, total_ssim / num_batches
+    
+    def train(self, num_epochs, config, save_dir='enhanced_vqvae2_checkpoints', resume_checkpoint=None):
+        os.makedirs(save_dir, exist_ok=True)
+        
+        best_ssim = 0.0
+        start_epoch = 0
+        
+        # Resume from checkpoint if provided
+        if resume_checkpoint and os.path.exists(resume_checkpoint):
+            checkpoint = torch.load(resume_checkpoint)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_ssim = checkpoint.get('best_ssim', 0.0)
+            
+            # Load training history
+            self.train_losses = self._ensure_list(checkpoint.get('train_losses', []))
+            self.val_losses = self._ensure_list(checkpoint.get('val_losses', []))
+            self.train_ssim = self._ensure_list(checkpoint.get('train_ssim', []))
+            self.val_ssim = self._ensure_list(checkpoint.get('val_ssim', []))
+            self.perplexities = self._ensure_list(checkpoint.get('perplexities', []))
+            
+            print(f"✅ Resumed training from epoch {start_epoch}")
+            print(f"   Previous best SSIM: {best_ssim:.4f}")
+
+        print("🚀 Starting Enhanced VQVAE-2 Training...")
+        
+        for epoch in range(start_epoch, num_epochs):
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
+            
+            train_loss, train_ssim, perplexity = self.train_epoch()
+            val_loss, val_ssim = self.validate_epoch()
+            
+            # Store metrics
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.train_ssim.append(train_ssim)
+            self.val_ssim.append(val_ssim)
+            self.perplexities.append(perplexity)
+            
+            print(f"Train Loss: {train_loss:.4f}, Train SSIM: {train_ssim:.4f}")
+            print(f"Val Loss: {val_loss:.4f}, Val SSIM: {val_ssim:.4f}")
+            print(f"Perplexity: {perplexity:.2f}")
+            
+            # Save best model checkpoint based on validation SSIM
+            if val_ssim > best_ssim:
+                best_ssim = val_ssim
+                
+                checkpoint_data = {
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'val_ssim': val_ssim,
+                    'best_ssim': best_ssim,
+                    'config': config,
+                    # Save history for resuming
+                    'train_losses': self.train_losses,
+                    'val_losses': self.val_losses,
+                    'train_ssim': self.train_ssim,
+                    'val_ssim': self.val_ssim,
+                    'perplexities': self.perplexities,
+                }
+                
+                torch.save(checkpoint_data, os.path.join(save_dir, 'best_model.pth'))
+                print(f"✅ Saved best model with SSIM: {val_ssim:.4f} (epoch {epoch+1})")
+                
+        return best_ssim
+
+    def _ensure_list(self, data):
+        """Helper to ensure loaded metric data is a list."""
+        if isinstance(data, (int, float)):
+            return [data]
+        return data if isinstance(data, list) else []
 
 def main():
     parser = argparse.ArgumentParser(description='Enhanced VQVAE-2 Training')
