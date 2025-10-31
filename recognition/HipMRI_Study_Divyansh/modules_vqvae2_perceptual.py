@@ -160,4 +160,43 @@ class TopDownEncoder(nn.Module):
         # Return features in original order (largest to smallest)
         return outputs[::-1]
 
+class Decoder(nn.Module):
+    """Decoder that reconstructs the image from quantized features."""
+    def __init__(self, embedding_dims, out_channels=1, num_residual_blocks=2):
+        super(Decoder, self).__init__()
+        
+        # The decoder architecture starts with the highest-level (most compressed)
+        # feature's embedding dimension.
+        current_channels = embedding_dims[0]
+        
+        layers = []
+        
+        # Process the initial feature map
+        layers.extend([
+            ResidualBlock(current_channels),
+            nn.Conv2d(current_channels, 128, 3, 1, 1),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(True),
+            ResidualBlock(128)
+        ])
+        current_channels = 128
+        
+        # Final upsampling block to restore original image size
+        layers.extend([
+            nn.ConvTranspose2d(current_channels, 64, 4, 2, 1), # Upsamples to 128x128
+            nn.InstanceNorm2d(64),
+            nn.ReLU(True),
+            ResidualBlock(64),
+            nn.Conv2d(64, out_channels, 3, 1, 1),
+            nn.Tanh() # Tanh activation to scale output to [-1, 1]
+        ])
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, quantized_features):
+        # The VQVAE-2 decoder typically only uses the features
+        # from the highest level of the hierarchy for reconstruction.
+        x = quantized_features[0]
+        return self.network(x)
+
 print("modules_vqvae2_perceptual.py loaded.")
