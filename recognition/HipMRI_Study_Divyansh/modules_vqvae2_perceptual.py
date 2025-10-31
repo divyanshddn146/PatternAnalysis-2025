@@ -76,4 +76,88 @@ class VectorQuantizer(nn.Module):
         
         return loss, quantized, perplexity, encoding_indices
 
+class BottomUpEncoder(nn.Module):
+    """Bottom-up encoder for VQVAE-2 that extracts features at multiple scales."""
+    def __init__(self, in_channels=1, base_channels=64, num_levels=3, num_residual_blocks=2):
+        super(BottomUpEncoder, self).__init__()
+        self.num_levels = num_levels
+        
+        # Initial convolution
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 4, 2, 1),
+            nn.InstanceNorm2d(base_channels),
+            nn.ReLU(True)
+        )
+        
+        # Bottom-up blocks
+        self.blocks = nn.ModuleList()
+        current_channels = base_channels
+        
+        for i in range(num_levels):
+            level_blocks = []
+            for _ in range(num_residual_blocks):
+                level_blocks.append(ResidualBlock(current_channels))
+            
+            # Downsample for the next level (except for the last one)
+            if i < num_levels - 1:
+                level_blocks.extend([
+                    nn.Conv2d(current_channels, current_channels * 2, 4, 2, 1),
+                    nn.InstanceNorm2d(current_channels * 2),
+                    nn.ReLU(True)
+                ])
+                current_channels *= 2
+            
+            self.blocks.append(nn.Sequential(*level_blocks))
+    
+    def forward(self, x):
+        features = []
+        x = self.initial_conv(x)
+        
+        for block in self.blocks:
+            x = block(x)
+            features.append(x)
+        
+        return features
+
+class TopDownEncoder(nn.Module):
+    """Top-down encoder that refines features using skip connections."""
+    def __init__(self, channels_list, num_residual_blocks=2):
+        super(TopDownEncoder, self).__init__()
+        self.blocks = nn.ModuleList()
+        
+        # Process from the smallest feature map to the largest
+        for i, channels in enumerate(channels_list[::-1]):
+            block_layers = []
+            
+            # Upsample from the previous level (except for the very first top-level block)
+            if i > 0:
+                block_layers.extend([
+                    nn.ConvTranspose2d(prev_channels, channels, 4, 2, 1),
+                    nn.InstanceNorm2d(channels),
+                    nn.ReLU(True)
+                ])
+            
+            for _ in range(num_residual_blocks):
+                block_layers.append(ResidualBlock(channels))
+            
+            self.blocks.append(nn.Sequential(*block_layers))
+            prev_channels = channels
+    
+    def forward(self, bottom_up_features):
+        # Reverse the features to start from the top (smallest spatial dimension)
+        features = bottom_up_features[::-1]
+        x = features[0]
+        
+        outputs = []
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            outputs.append(x)
+            
+            # Add skip connection from the corresponding bottom-up feature map
+            if i < len(features) - 1:
+                x = x + features[i + 1]
+        
+        # Return features in original order (largest to smallest)
+        return outputs[::-1]
+
 print("modules_vqvae2_perceptual.py loaded.")
