@@ -199,4 +199,55 @@ class Decoder(nn.Module):
         x = quantized_features[0]
         return self.network(x)
 
+class EnhancedVQVAE2(nn.Module):
+    """Assembles the full VQ-VAE 2 model with hierarchical encoders and quantizers."""
+    def __init__(self, in_channels=1, base_channels=64, num_levels=3, 
+                 embedding_dims=[256, 128, 64], num_embeddings_list=[512, 512, 512],
+                 commitment_cost=0.25, num_residual_blocks=2, device='cuda'):
+        super(EnhancedVQVAE2, self).__init__()
+        
+        self.num_levels = num_levels
+        
+        # Encoders
+        self.bottom_up_encoder = BottomUpEncoder(
+            in_channels, base_channels, num_levels, num_residual_blocks
+        )
+        
+        channel_sizes = [base_channels * (2 ** i) for i in range(num_levels)]
+        self.top_down_encoder = TopDownEncoder(channel_sizes, num_residual_blocks)
+        
+        # Quantizers
+        self.quantizer_conv_layers = nn.ModuleList()
+        self.quantizers = nn.ModuleList()
+        
+        for i, (embed_dim, num_emb) in enumerate(zip(embedding_dims, num_embeddings_list)):
+            self.quantizer_conv_layers.append(nn.Conv2d(channel_sizes[i], embed_dim, 1))
+            self.quantizers.append(VectorQuantizer(num_emb, embed_dim, commitment_cost))
+        
+        # Decoder
+        self.decoder = Decoder(embedding_dims, in_channels, num_residual_blocks)
+    
+    def forward(self, x):
+        # Encode
+        bottom_up_features = self.bottom_up_encoder(x)
+        top_down_features = self.top_down_encoder(bottom_up_features)
+        
+        # Quantize at each level
+        total_vq_loss = 0
+        total_perplexity = 0
+        quantized_features = []
+        
+        for feature, quant_conv, quantizer in zip(top_down_features, self.quantizer_conv_layers, self.quantizers):
+            projected = quant_conv(feature)
+            vq_loss, quantized, perplexity, _ = quantizer(projected)
+            
+            total_vq_loss += vq_loss
+            total_perplexity += perplexity
+            quantized_features.append(quantized)
+        
+        # Decode
+        reconstructions = self.decoder(quantized_features)
+        
+        return reconstructions, total_vq_loss, total_perplexity / self.num_levels
+
 print("modules_vqvae2_perceptual.py loaded.")
