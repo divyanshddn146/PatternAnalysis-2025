@@ -9,7 +9,7 @@ import time
 from tqdm import tqdm
 import argparse
 
-from modules_vqvae2_perceptual import EnhancedVQVAE2, calculate_ssim
+from modules import EnhancedVQVAE2, calculate_ssim
 
 class EnhancedVQVAE2Trainer:
     def __init__(self, model, train_loader, val_loader, device, learning_rate=1.5e-4):
@@ -48,8 +48,8 @@ class EnhancedVQVAE2Trainer:
         num_batches = 0
         
         epoch_loss_components = {
-            'mse': 0, 'perceptual': 0, 'ssim_loss': 0, 'ssim_value': 0, 'vq': 0
-        }
+    'mse': 0, 'perceptual': 0, 'ssim_loss': 0, 'ssim_value': 0, 'vq': 0, 'total': 0
+}
         
         pbar = tqdm(self.train_loader, desc="Enhanced VQVAE-2 Training")
         for batch_idx, (data, _) in enumerate(pbar):
@@ -79,8 +79,9 @@ class EnhancedVQVAE2Trainer:
             num_batches += 1
             
             # Accumulate loss components
-            for key in epoch_loss_components:
-                epoch_loss_components[key] += loss_components[key]
+            for key, value in loss_components.items():
+                if key in epoch_loss_components:
+                    epoch_loss_components[key] += value
             
             pbar.set_postfix({
                 'Total Loss': f'{total_loss_batch.item():.4f}',

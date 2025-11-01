@@ -1,49 +1,73 @@
+# advanced_visualizations.py
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
 import torch.nn.functional as F
+from tqdm import tqdm
+
+# We need this to calculate SSIM, as it's part of the plot
+from modules_vqvae2_perceptual import calculate_ssim
+
 
 class AdvancedVisualizations:
     def __init__(self, model, device):
         self.model = model
         self.device = device
     
-    def plot_latent_space_2d(self, dataloader, num_samples=1000, save_path='latent_space_2d.png'):
-        """Visualize 2D projection of latent space using t-SNE"""
+    def plot_latent_space_2d(self, dataloader, level=0, num_samples=1000, save_path='latent_space_2d.png'):
+        """
+        Visualize 2D projection of the *embedding vectors* from a specific level.
+        Uses t-SNE to show which codebook vectors are being used and how they cluster.
+        """
         self.model.eval()
         
         all_codes = []
         all_labels = []
         
-        with torch.no_grad():
-            for batch_idx, (data, _) in enumerate(dataloader):
-                if batch_idx * dataloader.batch_size >= num_samples:
-                    break
-                    
-                data = data.to(self.device)
-                quantized, encoding_indices = self.model.encode(data)
-                
-                # Flatten encoding indices
-                codes = encoding_indices.view(-1).cpu().numpy()
-                all_codes.extend(codes)
-                all_labels.extend([batch_idx] * len(codes))
+        print(f"Generating t-SNE plot for level {level}. This may take a while...")
         
-        # Convert to numpy arrays
-        all_codes = np.array(all_codes)
+        # --- THIS ENTIRE BLOCK HAS BEEN REPLACED ---
+        with torch.no_grad():
+            for batch_idx, (data, _) in enumerate(tqdm(dataloader, desc="Collecting Latent Vectors")):
+                data = data.to(self.device)
+                _, encoding_indices_list = self.model.encode(data)
+                indices = encoding_indices_list[level].view(-1).cpu()
+                
+                codebook = self.model.quantizers[level].embedding.weight
+                codes = codebook[indices].detach().cpu().numpy()
+                
+                all_codes.append(codes)
+                all_labels.extend([batch_idx] * len(codes))
+                
+                # --- THIS IS THE FIX ---
+                # Check the total number of *vectors* collected so far
+                # We use .shape[0] on the concatenated array to get the true count
+                if np.concatenate(all_codes, axis=0).shape[0] >= num_samples:
+                    break
+                # --- END OF FIX ---
+        
+        all_codes = np.concatenate(all_codes, axis=0)
         all_labels = np.array(all_labels)
         
-        # Use t-SNE for 2D visualization
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30)
-        codes_2d = tsne.fit_transform(all_codes.reshape(-1, 1))
+        # --- ADD THIS BLOCK TO TRIM THE DATA ---
+        # Ensure we have exactly num_samples
+        if all_codes.shape[0] > num_samples:
+            all_codes = all_codes[:num_samples]
+            all_labels = all_labels[:num_samples]
+        # --- END OF BLOCK ---
+        # --- END OF REPLACED BLOCK ---
+        
+        # Use t-SNE for 2D visualization (n_iter is now max_iter)
+        tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=300)
+        codes_2d = tsne.fit_transform(all_codes)
         
         plt.figure(figsize=(12, 10))
         scatter = plt.scatter(codes_2d[:, 0], codes_2d[:, 1], c=all_labels, 
                             cmap='viridis', alpha=0.6, s=10)
-        plt.colorbar(scatter, label='Batch Index')
-        plt.title('t-SNE Visualization of Discrete Latent Space')
+        plt.colorbar(scatter, label='Data Batch Index')
+        plt.title(f't-SNE Visualization of Latent Space Embeddings (Level {level})')
         plt.xlabel('t-SNE Component 1')
         plt.ylabel('t-SNE Component 2')
         plt.grid(True, alpha=0.3)
@@ -51,22 +75,28 @@ class AdvancedVisualizations:
         plt.show()
         
         return codes_2d
-    
-    def plot_codebook_usage(self, dataloader, save_path='codebook_usage.png'):
-        """Visualize codebook embedding usage statistics"""
+
+    def plot_codebook_usage(self, dataloader, level=0, save_path='codebook_usage.png'):
+        """Visualize codebook embedding usage statistics for a specific level."""
         self.model.eval()
         
-        codebook_size = self.model.vector_quantizer.num_embeddings
+        # Access the specific quantizer from your model's list
+        codebook_size = self.model.quantizers[level].num_embeddings
         usage_count = torch.zeros(codebook_size)
         
         with torch.no_grad():
-            for data, _ in dataloader:
+            for data, _ in tqdm(dataloader, desc=f"Calculating Codebook Usage (Level {level})"):
                 data = data.to(self.device)
-                _, encoding_indices = self.model.encode(data)
+                
+                # Get the list of encoding indices
+                _, encoding_indices_list = self.model.encode(data)
+                
+                # Get the indices for the specified level
+                encoding_indices = encoding_indices_list[level]
                 
                 # Count usage of each code
                 unique, counts = torch.unique(encoding_indices, return_counts=True)
-                usage_count[unique] += counts.cpu()
+                usage_count[unique.cpu()] += counts.cpu()
         
         # Plot usage distribution
         plt.figure(figsize=(15, 5))
@@ -75,7 +105,7 @@ class AdvancedVisualizations:
         plt.bar(range(codebook_size), usage_count.numpy(), alpha=0.7)
         plt.xlabel('Codebook Index')
         plt.ylabel('Usage Count')
-        plt.title('Codebook Usage Distribution')
+        plt.title(f'Codebook Usage Distribution (Level {level})')
         plt.grid(True, alpha=0.3)
         
         plt.subplot(1, 2, 2)
@@ -92,77 +122,19 @@ class AdvancedVisualizations:
         plt.show()
         
         usage_rate = (usage_count > 0).float().mean()
-        print(f"Codebook Usage Rate: {usage_rate.item()*100:.2f}%")
-        print(f"Most used code: {torch.argmax(usage_count).item()} (count: {torch.max(usage_count).item()})")
-        print(f"Least used code: {torch.argmin(usage_count).item()} (count: {torch.min(usage_count).item()})")
+        print(f"--- Codebook Usage (Level {level}) ---")
+        print(f"Codebook Usage Rate: {usage_rate.item()*100:.2f}% ({torch.sum(usage_count > 0)} / {codebook_size})")
+        print(f"Most used code: {torch.argmax(usage_count).item()} (count: {torch.max(usage_count).item():.0f})")
+        print(f"Least used code: {torch.argmin(usage_count).item()} (count: {torch.min(usage_count).item():.0f})")
         
         return usage_count
     
-    def plot_training_curves_comprehensive(self, trainer, save_path='training_curves_comprehensive.png'):
-        """Comprehensive training analysis with multiple subplots"""
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        
-        # Loss curves
-        axes[0, 0].plot(trainer.train_losses, label='Train Loss', linewidth=2)
-        axes[0, 0].plot(trainer.val_losses, label='Val Loss', linewidth=2)
-        axes[0, 0].set_title('Training and Validation Loss')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # SSIM curves
-        axes[0, 1].plot(trainer.train_ssim, label='Train SSIM', linewidth=2)
-        axes[0, 1].plot(trainer.val_ssim, label='Val SSIM', linewidth=2)
-        axes[0, 1].axhline(y=0.6, color='r', linestyle='--', label='Target SSIM (0.6)')
-        axes[0, 1].set_title('Structural Similarity Index (SSIM)')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('SSIM')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Perplexity
-        axes[0, 2].plot(trainer.perplexities, 'g-', linewidth=2)
-        axes[0, 2].set_title('Codebook Perplexity')
-        axes[0, 2].set_xlabel('Epoch')
-        axes[0, 2].set_ylabel('Perplexity')
-        axes[0, 2].grid(True, alpha=0.3)
-        
-        # Loss derivatives (smoothed)
-        train_loss_deriv = np.gradient(trainer.train_losses)
-        val_loss_deriv = np.gradient(trainer.val_losses)
-        axes[1, 0].plot(train_loss_deriv, label='Train Loss Derivative', alpha=0.7)
-        axes[1, 0].plot(val_loss_deriv, label='Val Loss Derivative', alpha=0.7)
-        axes[1, 0].axhline(y=0, color='k', linestyle='-', alpha=0.3)
-        axes[1, 0].set_title('Loss Derivatives (Convergence Analysis)')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('d(Loss)/dEpoch')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # SSIM improvement rate
-        ssim_improvement = np.gradient(trainer.val_ssim)
-        axes[1, 1].plot(ssim_improvement, 'purple', linewidth=2)
-        axes[1, 1].axhline(y=0, color='k', linestyle='-', alpha=0.3)
-        axes[1, 1].set_title('SSIM Improvement Rate')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('d(SSIM)/dEpoch')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        # Loss vs SSIM correlation
-        axes[1, 2].scatter(trainer.val_losses, trainer.val_ssim, 
-                          c=range(len(trainer.val_losses)), cmap='viridis', alpha=0.6)
-        axes[1, 2].set_xlabel('Validation Loss')
-        axes[1, 2].set_ylabel('Validation SSIM')
-        axes[1, 2].set_title('Loss vs SSIM Correlation')
-        axes[1, 2].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.show()
-    
     def plot_reconstruction_quality_analysis(self, dataloader, num_samples=5, save_path='reconstruction_quality.png'):
-        """Detailed analysis of reconstruction quality"""
+        """
+        Detailed analysis of reconstruction quality.
+        This function worked correctly as-is, but we must use a denormalized
+        SSIM calculation.
+        """
         self.model.eval()
         
         data_iter = iter(dataloader)
@@ -172,36 +144,37 @@ class AdvancedVisualizations:
         with torch.no_grad():
             reconstructions, _, _ = self.model(images)
         
-        # Denormalize
-        images = (images + 1) / 2
-        reconstructions = (reconstructions + 1) / 2
+        # Denormalize from [-1, 1] to [0, 1] for visualization and SSIM
+        images_norm = (images + 1) / 2
+        reconstructions_norm = (reconstructions + 1) / 2
         
-        fig, axes = plt.subplots(4, num_samples, figsize=(20, 16))
+        fig, axes = plt.subplots(4, num_samples, figsize=(4 * num_samples, 16))
         
         if num_samples == 1:
             axes = axes.reshape(4, 1)
         
         for i in range(num_samples):
             # Original
-            axes[0, i].imshow(images[i].cpu().squeeze(), cmap='gray')
+            axes[0, i].imshow(images_norm[i].cpu().squeeze(), cmap='gray')
             axes[0, i].set_title(f'Original {i+1}')
             axes[0, i].axis('off')
             
             # Reconstruction
-            axes[1, i].imshow(reconstructions[i].cpu().squeeze(), cmap='gray')
-            ssim = calculate_ssim(reconstructions[i:i+1], images[i:i+1]).item()
-            axes[1, i].set_title(f'Reconstruction\nSSIM: {ssim:.3f}')
+            axes[1, i].imshow(reconstructions_norm[i].cpu().squeeze(), cmap='gray')
+            
+            # Calculate SSIM on the [0, 1] normalized images
+            ssim = calculate_ssim(reconstructions_norm[i:i+1], images_norm[i:i+1], data_range=1.0).item()
+            axes[1, i].set_title(f'Reconstruction\nSSIM: {ssim:.4f}')
             axes[1, i].axis('off')
             
             # Absolute difference
-            diff = torch.abs(images[i] - reconstructions[i])
-            im = axes[2, i].imshow(diff.cpu().squeeze(), cmap='hot')
+            diff = torch.abs(images_norm[i] - reconstructions_norm[i])
+            im = axes[2, i].imshow(diff.cpu().squeeze(), cmap='hot', vmin=0, vmax=1)
             axes[2, i].set_title(f'Absolute Difference\nMax: {diff.max().item():.3f}')
             axes[2, i].axis('off')
-            plt.colorbar(im, ax=axes[2, i], fraction=0.046)
             
             # Error histogram
-            axes[3, i].hist(diff.cpu().flatten().numpy(), bins=50, alpha=0.7, edgecolor='black')
+            axes[3, i].hist(diff.cpu().flatten().numpy(), bins=50, range=(0, 1), alpha=0.7)
             axes[3, i].set_title(f'Error Distribution\nMean: {diff.mean().item():.4f}')
             axes[3, i].set_xlabel('Error Magnitude')
             axes[3, i].set_ylabel('Frequency')
@@ -210,20 +183,3 @@ class AdvancedVisualizations:
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.show()
-
-def calculate_ssim(x, y, data_range=1.0):
-    """Calculate Structural Similarity Index"""
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
-    
-    mu_x = F.avg_pool2d(x, 3, 1, 1)
-    mu_y = F.avg_pool2d(y, 3, 1, 1)
-    
-    sigma_x = F.avg_pool2d(x ** 2, 3, 1, 1) - mu_x ** 2
-    sigma_y = F.avg_pool2d(y ** 2, 3, 1, 1) - mu_y ** 2
-    sigma_xy = F.avg_pool2d(x * y, 3, 1, 1) - mu_x * mu_y
-    
-    ssim_numerator = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
-    ssim_denominator = (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2)
-    
-    return torch.mean(ssim_numerator / ssim_denominator)
