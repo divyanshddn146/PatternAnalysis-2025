@@ -28,7 +28,7 @@ class ProstateMRIDataset(Dataset):
         self.target_size = target_size
         self.use_segmentation = use_segmentation
         
-        # CORRECTED: Build the correct path based on folder structure
+        # Build the correct path based on folder structure
         if use_segmentation:
             self.data_path = os.path.join(data_dir, f'keras_slices_seg_{data_type}')
         else:
